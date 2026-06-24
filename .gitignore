@@ -46,3 +46,7 @@ test_results.txt
 /QuantumLanguage.txt
 /build_errors.txt
 /build_log.txt
+
+
+/memory_profile.txt
+/memory_leak_report.txt
