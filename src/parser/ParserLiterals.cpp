@@ -55,6 +55,50 @@ ASTNodePtr Parser::parsePrimary()
         return std::make_unique<ASTNode>(Identifier{"self"}, ln);
     }
 
+    // Python lambda: lambda x, y: expr
+    // Only when a ':' follows on the same line — otherwise "lambda" stays a
+    // plain identifier so variables named lambda keep working.
+    if (tok.type == TokenType::IDENTIFIER && tok.value == "lambda")
+    {
+        size_t la = pos + 1;
+        bool sawColon = false;
+        while (la < tokens.size() && tokens[la].type != TokenType::NEWLINE &&
+               tokens[la].type != TokenType::EOF_TOKEN)
+        {
+            if (tokens[la].type == TokenType::COLON)
+            {
+                sawColon = true;
+                break;
+            }
+            if (tokens[la].type != TokenType::IDENTIFIER &&
+                tokens[la].type != TokenType::COMMA)
+                break; // params can only be names and commas
+            la++;
+        }
+        if (sawColon)
+        {
+            consume(); // eat 'lambda'
+            std::vector<std::string> params;
+            while (!check(TokenType::COLON) && !atEnd())
+            {
+                if (check(TokenType::IDENTIFIER))
+                    params.push_back(consume().value);
+                else if (!match(TokenType::COMMA))
+                    break;
+            }
+            expect(TokenType::COLON, "Expected ':' in lambda");
+            auto bodyExpr = parseAssignment(); // single expression body
+            int eln = bodyExpr->line;
+            auto retStmt = std::make_unique<ASTNode>(ReturnStmt{std::move(bodyExpr)}, eln);
+            BlockStmt block;
+            block.statements.push_back(std::move(retStmt));
+            LambdaExpr le;
+            le.params = std::move(params);
+            le.body = std::make_unique<ASTNode>(std::move(block), ln);
+            return std::make_unique<ASTNode>(std::move(le), ln);
+        }
+    }
+
     // new int(100) / new ClassName(args) / new int[n]
     if (tok.type == TokenType::NEW)
     {
@@ -83,6 +127,25 @@ ASTNodePtr Parser::parsePrimary()
             ne.typeName = name;
             ne.isArray = true;
             ne.sizeExpr = std::move(sizeNode);
+            return std::make_unique<ASTNode>(std::move(ne), ln);
+        }
+
+        // new Node{val, nullptr} — C++ brace-initializer constructor arguments
+        if (check(TokenType::LBRACE))
+        {
+            consume(); // eat '{'
+            skipNewlines();
+            NewExpr ne;
+            ne.typeName = name;
+            while (!check(TokenType::RBRACE) && !atEnd())
+            {
+                ne.args.push_back(parseExpr());
+                skipNewlines();
+                if (!match(TokenType::COMMA))
+                    break;
+                skipNewlines();
+            }
+            expect(TokenType::RBRACE, "Expected '}'");
             return std::make_unique<ASTNode>(std::move(ne), ln);
         }
 
@@ -1183,10 +1246,22 @@ ASTNodePtr Parser::parseCTypeVarDecl(const std::string &typeHint)
 
     // Skip C array dimension brackets: char map[ROWS][COLS], int arr[N], etc.
     bool isArray = false;
+    std::vector<ASTNodePtr> arrayDims;
     while (check(TokenType::LBRACKET))
     {
         isArray = true;
         consume(); // eat '['
+        // Capture the dimension expression so "int arr[N]" can allocate
+        if (!check(TokenType::RBRACKET))
+        {
+            try
+            {
+                arrayDims.push_back(parseExpr());
+            }
+            catch (...)
+            {
+            }
+        }
         int bdepth = 1;
         while (!atEnd() && bdepth > 0)
         {
@@ -1202,7 +1277,34 @@ ASTNodePtr Parser::parseCTypeVarDecl(const std::string &typeHint)
         finalTypeHint += "[]";
     ASTNodePtr init;
     if (match(TokenType::ASSIGN))
+    {
         init = parseExpr();
+        // C aggregate zero-init: int m[10][10] = {0}; — "{0}" means
+        // "zero-fill the whole array", not a one-element array.
+        bool zeroFillIdiom = false;
+        if (!arrayDims.empty() && init && init->is<ArrayLiteral>())
+        {
+            auto &els = init->as<ArrayLiteral>().elements;
+            zeroFillIdiom = els.empty() ||
+                            (els.size() == 1 && els[0]->is<NumberLiteral>() &&
+                             els[0]->as<NumberLiteral>().value == 0.0);
+        }
+        if (zeroFillIdiom)
+        {
+            CallExpr mk;
+            mk.callee = std::make_unique<ASTNode>(Identifier{"__c_array__"}, ln);
+            mk.args = std::move(arrayDims);
+            init = std::make_unique<ASTNode>(std::move(mk), ln);
+        }
+    }
+    else if (!arrayDims.empty())
+    {
+        // int arr[10] / char grid[R][C] — allocate a zero-filled (nested) array
+        CallExpr mk;
+        mk.callee = std::make_unique<ASTNode>(Identifier{"__c_array__"}, ln);
+        mk.args = std::move(arrayDims);
+        init = std::make_unique<ASTNode>(std::move(mk), ln);
+    }
     auto decl = VarDecl{false, nameToken.value, std::move(init), finalTypeHint};
     decl.isPointer = isPointer;
     auto node = std::make_unique<ASTNode>(std::move(decl), ln);

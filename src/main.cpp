@@ -512,13 +512,15 @@ static TestResult testFile(const std::string &path)
     return res;
 }
 
-static void collectSaFiles(const fs::path &dir, std::vector<fs::path> &out)
+static void collectTestFiles(const fs::path &dir, std::vector<fs::path> &out)
 {
+    // Any file type the compiler runs natively is testable:
+    // .sa .js .py .c .cpp — all share the same multi-syntax pipeline.
     if (!fs::exists(dir) || !fs::is_directory(dir))
         return;
     for (auto &e : fs::recursive_directory_iterator(
              dir, fs::directory_options::skip_permission_denied))
-        if (e.is_regular_file() && e.path().extension() == ".sa")
+        if (e.is_regular_file() && hasSupportedExt(e.path().string()))
             out.push_back(e.path());
 }
 
@@ -650,10 +652,10 @@ static int runTestExamples(const std::string &dir)
     g_testMode = true;
 
     std::vector<fs::path> files;
-    collectSaFiles(d, files);
+    collectTestFiles(d, files);
     if (files.empty())
     {
-        std::cout << "No .sa files found.\n";
+        std::cout << "No testable files found (.sa .js .py .c .cpp).\n";
         return 0;
     }
     std::sort(files.begin(), files.end());
@@ -793,7 +795,7 @@ static void printHelp(const char *prog)
               << "  " << prog << " --check <file>     Parse + type-check only\n"
               << "  " << prog << " --debug <file>     Dump bytecode then run\n"
               << "  " << prog << " --dis   <file>     Dump bytecode only\n"
-              << "  " << prog << " --test  [dir]      Batch-test all .sa files\n"
+              << "  " << prog << " --test  [dir]      Batch-test all supported source files\n"
               << "  qrun <file>                 Interpret directly (no .exe)\n\n"
               << "  Supported files: .sa .js .py .c .cpp — all run natively on the\n"
               << "  Quantum VM (multi-syntax subset; node/python/gcc NOT required)\n\n"

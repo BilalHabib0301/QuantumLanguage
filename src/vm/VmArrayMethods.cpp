@@ -28,6 +28,55 @@ QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr, const std::string &
     }
     if (m == "length" || m == "size")
         return QuantumValue((double)arr->size());
+    // C++ compatibility: a.begin()/a.end() return the array itself so
+    // iterator-style calls like sort(a.begin(), a.end()) see the array.
+    if (m == "begin" || m == "end")
+        return QuantumValue(arr);
+    // C++ std::vector / stack / queue method names
+    if (m == "push_back" || m == "emplace_back" || m == "push_front")
+    {
+        for (auto &v : args)
+        {
+            if (m == "push_front")
+                arr->insert(arr->begin(), v);
+            else
+                arr->push_back(v);
+        }
+        return QuantumValue((double)arr->size());
+    }
+    if (m == "pop_back")
+    {
+        if (arr->empty())
+            return QuantumValue();
+        QuantumValue v = arr->back();
+        arr->pop_back();
+        return v;
+    }
+    if (m == "pop_front")
+    {
+        if (arr->empty())
+            return QuantumValue();
+        QuantumValue v = arr->front();
+        arr->erase(arr->begin());
+        return v;
+    }
+    if (m == "empty")
+        return QuantumValue(arr->empty());
+    if (m == "front")
+        return arr->empty() ? QuantumValue() : arr->front();
+    if (m == "back" || m == "top")
+        return arr->empty() ? QuantumValue() : arr->back();
+    if (m == "at")
+    {
+        if (args.empty())
+            throw RuntimeError("at() requires an index");
+        int i = (int)args[0].asNumber();
+        if (i < 0)
+            i += (int)arr->size();
+        if (i < 0 || i >= (int)arr->size())
+            throw RuntimeError("at(): index out of range");
+        return (*arr)[i];
+    }
     if (m == "shift")
     {
         if (arr->empty())

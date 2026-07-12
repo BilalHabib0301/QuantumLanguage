@@ -433,7 +433,7 @@ quantum --run <file>        Interpret directly (no .exe created)
 quantum --check <file>      Parse + type-check only, no execution
 quantum --debug <file>      Dump bytecode disassembly, then run
 quantum --dis   <file>      Dump bytecode disassembly only, then exit
-quantum --test  [dir]       Batch-test all .sa files in directory
+quantum --test  [dir]       Batch-test all .sa/.js/.py/.c/.cpp files in directory
 quantum --version           Print version string
 quantum --help              Show usage
 quantum --aura              Print achievement board
