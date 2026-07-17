@@ -27,6 +27,10 @@
 #include <ctime>
 #include <iomanip>
 #include <cstdlib>
+#include <regex>
+#include <functional>
+#include <map>
+#include <set>
 
 // Windows-only — bundling and launching use Win32 API
 #ifndef WIN32_LEAN_AND_MEAN
@@ -581,9 +585,11 @@ static TestResult testFile(const std::string &path)
     res.source = ss.str();
 
     // ── Lex + parse ──────────────────────────────────────────────────────────
+    // Dialect-translate first (.rb/.c/.cpp) — parsing the raw source here would
+    // reject valid Ruby/C/C++ files before the real (dialect-aware) run below.
     try
     {
-        Lexer l(res.source);
+        Lexer l(applyDialect(res.source, path));
         auto tok = l.tokenize();
         Parser p(std::move(tok));
         auto ast = p.parse();
