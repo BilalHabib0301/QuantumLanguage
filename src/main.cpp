@@ -966,7 +966,7 @@ static std::string rbConvertRanges(std::string line, bool strict = true)
     // their own `new`, so their `.new` must survive this rewrite.
     static const char *kBuiltinModules =
         "(?!(?:Thread|Mutex|ConditionVariable|Queue|SizedQueue|File|Time|"
-        "Ractor|Fiber|TCPServer|TCPSocket|Struct|Dir|IO)\\b)";
+        "Ractor|Fiber|TCPServer|TCPSocket|Struct|Set|Dir|IO)\\b)";
     static const std::regex newCallRe(
         std::string("\\b") + kBuiltinModules + "([A-Za-z_][A-Za-z0-9_]*)\\.new\\(");
     line = std::regex_replace(line, newCallRe, "$1(");
@@ -979,7 +979,7 @@ static std::string rbConvertRanges(std::string line, bool strict = true)
     // The excluded builtin modules keep their `.new`, but Ruby still allows
     // it paren-less (`Queue.new`) — make that an actual call.
     static const std::regex builtinNewBareRe(
-        "\\b(Thread|Mutex|ConditionVariable|Queue|SizedQueue|Ractor|Fiber)\\.new\\b(?!\\()");
+        "\\b(Thread|Mutex|ConditionVariable|Queue|SizedQueue|Ractor|Fiber|Set)\\.new\\b(?!\\()");
     line = std::regex_replace(line, builtinNewBareRe, "$1.new()");
     // Ruby's "stabby lambda" -> Quantum's fn(...) literal.
     static const std::regex lambdaParamsRe("->\\s*\\(([^()]*)\\)\\s*\\{");
@@ -998,6 +998,54 @@ static std::string rbConvertRanges(std::string line, bool strict = true)
     // expression-parenthesization pass.
     static const std::regex spaceshipRe("([A-Za-z_][A-Za-z0-9_.\\[\\]]*)\\s*<=>\\s*([A-Za-z_][A-Za-z0-9_.\\[\\]]*)");
     line = std::regex_replace(line, spaceshipRe, "__spaceship__($1, $2)");
+    // Ruby's word-array literals: %w[a b c] / %i[a b c] (and the (), {}
+    // delimited spellings) -> an array of strings.
+    {
+        static const std::regex wordArrayRe("%[wi]([\\[({])([^\\])}]*)[\\])}]");
+        std::smatch m;
+        while (std::regex_search(line, m, wordArrayRe))
+        {
+            std::istringstream words(m[2].str());
+            std::string word, joined;
+            while (words >> word)
+            {
+                if (!joined.empty())
+                    joined += ", ";
+                joined += "\"" + word + "\"";
+            }
+            line = line.substr(0, m.position()) + "[" + joined + "]" +
+                   line.substr(m.position() + m.length());
+        }
+    }
+    // Ruby's `x.nil?` — a method that must work *on* nil, so it can't be
+    // dispatched like an ordinary method (the receiver is exactly the case
+    // it exists to detect). Becomes a plain comparison.
+    static const std::regex nilCheckRe(
+        "((?:@|self\\.)?[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*"
+        "(?:\\([^()]*\\))?(?:\\[[^\\[\\]]*\\])*)\\.nil\\?");
+    line = std::regex_replace(line, nilCheckRe, "($1 == null)");
+    // Ruby's range slice, `obj[a..b]` (inclusive) and `obj[a...b]`
+    // (exclusive), for strings and arrays. Bounds may be negative.
+    static const std::regex sliceRangeRe(
+        "((?:@|self\\.)?[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*"
+        "(?:\\([^()]*\\))?)\\[([^\\[\\]]+?)(\\.\\.\\.?)([^\\[\\]]*?)\\]");
+    {
+        std::smatch m;
+        while (std::regex_search(line, m, sliceRangeRe))
+        {
+            std::string upper = trimCopy(m[4].str());
+            std::string inclusive = (m[3].str() == "..") ? "true" : "false";
+            if (upper.empty()) // `a..` — through the end
+            {
+                upper = "-1";
+                inclusive = "true";
+            }
+            line = line.substr(0, m.position()) +
+                   "__slice_range(" + m[1].str() + ", " + trimCopy(m[2].str()) + ", " +
+                   upper + ", " + inclusive + ")" +
+                   line.substr(m.position() + m.length());
+        }
+    }
     // Ruby's two-argument slice, `obj[start, length]` — valid for both
     // strings and arrays, so it maps to a helper that handles either.
     // Single-index reads (including chained `dp[i][j]`) have no comma
@@ -1271,7 +1319,7 @@ static std::string rbBuildBlockOpenText(const std::string &prefix, const std::st
 }
 
 // ── Block-stack frame kinds for the main transform pass ───────────────────
-enum class RBFrameKind { Other, Def, ClosureDo, Branch, Loop };
+enum class RBFrameKind { Other, Def, ClosureDo, Branch, Loop, Class };
 enum class RBTailKind { None, Statement, Chain };
 
 struct RBTailInfo
@@ -1659,6 +1707,11 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
                                     : ln.find_first_not_of(" \t");
             if (stmtStart == std::string::npos)
                 stmtStart = ln.size();
+            // The array-literal `;` guard is only meaningful for a
+            // statement; once this becomes a value (returned or assigned)
+            // the leading `;` would split the expression in two.
+            if (stmtStart < ln.size() && ln[stmtStart] == ';')
+                ln.erase(stmtStart, 1);
             if (rbLooksLikeReturnable(ln.substr(stmtStart)))
                 ln.insert(stmtStart, "return ");
         }
@@ -1668,6 +1721,24 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
                 resolveTail(b);
         }
     };
+
+    // Inside a class body, Ruby lets one method call another with no
+    // receiver (`collect_words(child, ...)`); Quantum has no implicit-self
+    // dispatch, so those need `self.` added. Built once per file from the
+    // methods this file defines. Top-level `def`s are plain functions and
+    // must NOT be qualified, hence the enclosing-class check at use time.
+    std::string selfCallPattern;
+    for (const auto &name : symbols.methods)
+    {
+        if (name == "initialize" || name == "init")
+            continue;
+        if (!selfCallPattern.empty())
+            selfCallPattern += "|";
+        selfCallPattern += name;
+    }
+    const std::regex selfCallRe(
+        selfCallPattern.empty() ? "(?!)" : "(^|[^\\w.])(" + selfCallPattern + ")\\s*\\(");
+    bool inClassBody = false; // refreshed per line in the main loop below
 
     // Transforms a single "leaf" statement fragment: raise-comma, puts/print,
     // inline blocks, `<<` push, interpolation, bare-split, atom normalization.
@@ -1827,6 +1898,9 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
         code = rbConvertBlockCapture(code, strict);
         code = rbConvertInterpolation(code, symbols);
         code = rbNormalizeAtoms(code, symbols, strict);
+        // Implicit-self method call inside a class body (see selfCallRe).
+        if (strict && inClassBody)
+            code = std::regex_replace(code, selfCallRe, "$1self.$2(");
         if (code == "nil")
             code = "null";
         // A statement starting with a bare array literal (Ruby's
@@ -1854,6 +1928,14 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
     for (size_t li = 0; li < rawLines.size(); li++)
     {
         const std::string &rawLine = rawLines[li];
+        // Recomputed each line: are we lexically inside a `class ... end`?
+        inClassBody = false;
+        for (auto &f : stack)
+            if (f.kind == RBFrameKind::Class)
+            {
+                inClassBody = true;
+                break;
+            }
         size_t first = rawLine.find_first_not_of(" \t");
         if (first == std::string::npos)
         {
@@ -1989,6 +2071,8 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
                             size_t p = ln.find_first_not_of(" \t");
                             if (p == std::string::npos)
                                 continue;
+                            if (p < ln.size() && ln[p] == ';')
+                                ln.erase(p, 1);
                             if (rbLooksLikeReturnable(ln.substr(p)))
                                 ln.insert(p, top.assignTarget + " = ");
                         }
@@ -2198,7 +2282,7 @@ static std::string applyRubyDialect(const std::string &source, bool strict)
             else
                 header = "class " + rest;
             outLines.push_back(indentation + header + " {");
-            stack.push_back(RBFrame{RBFrameKind::Other, -1, RBTailInfo{}});
+            stack.push_back(RBFrame{RBFrameKind::Class, -1, RBTailInfo{}});
             continue;
         }
         {
